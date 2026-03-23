@@ -28,11 +28,11 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # ──────────────────────────────────────────────────────────────────
 # Configuração
 # ──────────────────────────────────────────────────────────────────
-BASE_URL = "http://localhost:8000"
+BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "http://localhost:8000")
+CALLBACK_PORT = 9000
+CALLBACK_BASE = os.environ.get("CALLBACK_BASE_URL", f"http://localhost:{CALLBACK_PORT}")
 REGISTER_URL = f"{BASE_URL}/webhook/register/"
 EVENTS_URL = f"{BASE_URL}/webhook/events/"
-CALLBACK_PORT = 9000
-CALLBACK_BASE = f"http://localhost:{CALLBACK_PORT}"
 
 # Mapa de evento → rota no Django e rota de callback local
 SERVICOS = {

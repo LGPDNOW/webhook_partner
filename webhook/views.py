@@ -1,21 +1,16 @@
-import base64
-import hashlib
-import hmac
 import json
 import logging
 import tempfile
-import threading
-import time
-import urllib.request
 
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
 from rest_framework.response import Response
 from drf_spectacular.utils import extend_schema, OpenApiExample, OpenApiParameter
 
 from .models import Consumer, Inscricao, WebhookLog
+from .tasks import TASK_MAP
 
 # ──────────────────────────────────────────────
-# Logger com formato detalhado para debug
+# Logger
 # ──────────────────────────────────────────────
 logger = logging.getLogger("webhook")
 logger.setLevel(logging.DEBUG)
@@ -60,7 +55,7 @@ def autenticar_consumer(request):
 
 
 def verificar_inscricao(consumer, evento):
-    """Verifica se o consumer está inscrito neste evento e retorna a Inscricao."""
+    """Verifica se o consumer está inscrito neste evento."""
     try:
         return Inscricao.objects.get(consumer=consumer, evento=evento, ativo=True)
     except Inscricao.DoesNotExist:
@@ -69,179 +64,11 @@ def verificar_inscricao(consumer, evento):
 
 
 # ═══════════════════════════════════════════════
-# SERVIÇOS (processam o evento e retornam o resultado)
+# HANDLER GENÉRICO — autentica e enfileira no Celery
 # ═══════════════════════════════════════════════
 
-def servico_gerar_primos(payload, log):
-    """Gera os primeiros N números primos com delay visual."""
-    quantidade = payload.get("quantidade", 10)
-    logger.info(f"🔢 [PRIMOS] Iniciando geração de {quantidade} primos…")
-
-    primos = []
-    candidato = 2
-    while len(primos) < quantidade:
-        if all(candidato % p != 0 for p in primos):
-            primos.append(candidato)
-            if len(primos) % 10 == 0:
-                logger.debug(f"🔢 [PRIMOS] Progresso: {len(primos)}/{quantidade} — último: {candidato}")
-            time.sleep(0.5)
-        candidato += 1
-
-    logger.info(f"🔢 [PRIMOS] Concluído! {quantidade} primos gerados. Último: {primos[-1]}")
-    return {"primos": primos, "total": quantidade}
-
-
-def servico_pokemon(payload, log):
-    """Consulta a PokéAPI e retorna dados do Pokémon."""
-    pokemon = payload.get("pokemon", "pikachu").lower().strip()
-    logger.info(f"🐾 [POKEMON] Consultando PokéAPI para '{pokemon}'…")
-
-    url = f"https://pokeapi.co/api/v2/pokemon/{pokemon}"
-    logger.debug(f"🐾 [POKEMON] GET {url}")
-
-    try:
-        with urllib.request.urlopen(url, timeout=10) as resp:
-            dados = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        logger.error(f"🐾 [POKEMON] Erro na PokéAPI: {e.code}")
-        raise ValueError(f"Pokémon '{pokemon}' não encontrado (HTTP {e.code})")
-
-    resultado = {
-        "nome": dados["name"],
-        "id": dados["id"],
-        "tipos": [t["type"]["name"] for t in dados["types"]],
-        "altura": dados["height"],
-        "peso": dados["weight"],
-        "habilidades": [a["ability"]["name"] for a in dados["abilities"]],
-        "sprite": dados["sprites"]["front_default"],
-    }
-
-    logger.info(f"🐾 [POKEMON] Concluído! {resultado['nome']} (#{resultado['id']}) — tipos: {resultado['tipos']}")
-    return resultado
-
-
-def servico_traduzir(payload, log):
-    """Traduz texto usando a Fun Translations API."""
-    texto = payload.get("texto", "Hello world")
-    idioma = payload.get("idioma", "yoda")
-    logger.info(f"🗣️ [TRADUÇÃO] Traduzindo para '{idioma}': \"{texto[:50]}…\"")
-
-    url = f"https://api.funtranslations.com/translate/{idioma}.json"
-    dados = json.dumps({"text": texto}).encode()
-    req = urllib.request.Request(url, data=dados, headers={"Content-Type": "application/json"})
-    logger.debug(f"🗣️ [TRADUÇÃO] POST {url}")
-
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            resposta = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        logger.error(f"🗣️ [TRADUÇÃO] Erro na API: {e.code}")
-        raise ValueError(f"Erro na Fun Translations API (HTTP {e.code}) — limite de 5 req/hora na versão gratuita")
-
-    traduzido = resposta["contents"]["translated"]
-    logger.info(f"🗣️ [TRADUÇÃO] Concluído! \"{traduzido[:80]}…\"")
-    return {"original": texto, "traduzido": traduzido, "idioma": idioma}
-
-
-def servico_converter_pdf(payload, log):
-    """Converte PDF para Markdown usando Docling. Recebe caminho do arquivo temporário."""
-    caminho_pdf = payload["caminho_pdf"]
-    nome_arquivo = payload["nome_arquivo"]
-    tamanho = payload["tamanho_bytes"]
-
-    logger.info(f"📄 [PDF→MD] Iniciando conversão: {nome_arquivo} ({tamanho} bytes)")
-    logger.info("📄 [PDF→MD] Processando com Docling (pode demorar)…")
-
-    from docling.document_converter import DocumentConverter
-
-    converter = DocumentConverter()
-    resultado = converter.convert(caminho_pdf)
-    markdown = resultado.document.export_to_markdown()
-
-    logger.info(f"📄 [PDF→MD] Concluído! {len(markdown)} caracteres de Markdown gerados")
-    return {"nome_arquivo": nome_arquivo, "markdown": markdown, "tamanho_chars": len(markdown)}
-
-
-# ═══════════════════════════════════════════════
-# CALLBACK — envia o resultado de volta ao consumer
-# ═══════════════════════════════════════════════
-
-def enviar_callback(consumer, inscricao, log, resultado):
-    """Envia o resultado assinado para o callback_url da inscrição."""
-    callback_url = inscricao.callback_url
-    logger.info(f"📤 [CALLBACK] Enviando para {callback_url}…")
-
-    corpo = json.dumps({
-        "evento": log.evento,
-        "status": "concluido",
-        "resultado": resultado,
-    }).encode()
-
-    assinatura = "sha256=" + hmac.new(
-        consumer.secret_key.encode(),
-        corpo,
-        hashlib.sha256,
-    ).hexdigest()
-
-    req = urllib.request.Request(
-        url=callback_url,
-        data=corpo,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "X-Hub-Signature-256": assinatura,
-            "X-Event-Type": log.evento,
-        },
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            logger.info(f"📤 [CALLBACK] Entregue com sucesso! HTTP {resp.status}")
-            log.status = "callback_enviado"
-    except Exception as e:
-        logger.error(f"📤 [CALLBACK] Falhou: {e}")
-        log.status = "callback_falhou"
-
-    log.save()
-
-
-# ═══════════════════════════════════════════════
-# PROCESSAMENTO EM BACKGROUND (thread)
-# ═══════════════════════════════════════════════
-
-def processar_em_background(consumer, inscricao, log, payload, servico_fn):
-    """Executa o serviço e envia o callback — roda em thread separada."""
-    evento = log.evento
-    logger.info(f"⚙️  [WORKER] Thread iniciada para evento='{evento}' | consumer={consumer.nome}")
-
-    log.status = "processando"
-    log.save()
-
-    try:
-        resultado = servico_fn(payload, log)
-
-        log.status = "concluido"
-        log.resultado = resultado
-        log.save()
-        logger.info(f"⚙️  [WORKER] Evento '{evento}' processado com sucesso!")
-
-        enviar_callback(consumer, inscricao, log, resultado)
-
-    except Exception as e:
-        logger.error(f"⚙️  [WORKER] Erro ao processar '{evento}': {e}")
-        log.status = "erro"
-        log.resultado = {"erro": str(e)}
-        log.save()
-
-        enviar_callback(consumer, inscricao, log, {"erro": str(e)})
-
-
-# ═══════════════════════════════════════════════
-# HANDLER GENÉRICO — usado por cada rota de evento
-# ═══════════════════════════════════════════════
-
-def processar_evento(request, evento, servico_fn):
-    """Lógica comum: autentica → verifica inscrição → dispara background."""
+def processar_evento(request, evento):
+    """Lógica comum: autentica → verifica inscrição → enfileira task no Celery."""
     logger.info("━" * 60)
     logger.info(f"📥 [{evento.upper()}] Nova requisição recebida")
 
@@ -266,13 +93,13 @@ def processar_evento(request, evento, servico_fn):
         consumer=consumer, inscricao=inscricao,
         evento=evento, payload=payload,
     )
-    logger.info(f"📥 [{evento.upper()}] Log #{log.pk} — callback será enviado para {inscricao.callback_url}")
+    logger.info(f"📥 [{evento.upper()}] Log #{log.pk} — enfileirando no Celery…")
 
-    thread = threading.Thread(
-        target=processar_em_background,
-        args=(consumer, inscricao, log, payload, servico_fn),
-    )
-    thread.start()
+    # Enfileira a task no Redis via Celery
+    task = TASK_MAP[evento]
+    task.delay(log.pk, payload, consumer.pk, inscricao.pk)
+
+    logger.info(f"📥 [{evento.upper()}] Task enfileirada! Callback será enviado para {inscricao.callback_url}")
 
     return Response({
         "status": "aceito",
@@ -283,7 +110,7 @@ def processar_evento(request, evento, servico_fn):
 
 
 # ═══════════════════════════════════════════════
-# Decoradores comuns
+# Swagger — parâmetros e respostas comuns
 # ═══════════════════════════════════════════════
 
 AUTH_HEADERS = [
@@ -300,7 +127,7 @@ RESPOSTAS_COMUNS = {
             "mensagem": {"type": "string"},
             "log_id": {"type": "integer", "example": 1},
         },
-        "description": "Evento aceito. Resultado será enviado via callback assinado com HMAC.",
+        "description": "Evento aceito e enfileirado no Celery. Resultado será enviado via callback assinado com HMAC.",
     },
     401: {"description": "api_key inválida ou ausente"},
     403: {"description": "Consumer não inscrito neste evento"},
@@ -308,7 +135,7 @@ RESPOSTAS_COMUNS = {
 
 
 # ═══════════════════════════════════════════════
-# 4 ROTAS DE EVENTOS — cada uma com sua view
+# 4 ROTAS DE EVENTOS
 # ═══════════════════════════════════════════════
 
 @extend_schema(
@@ -332,7 +159,7 @@ RESPOSTAS_COMUNS = {
 @authentication_classes([])
 @permission_classes([])
 def webhook_primos(request):
-    return processar_evento(request, "gerar_primos", servico_gerar_primos)
+    return processar_evento(request, "gerar_primos")
 
 
 @extend_schema(
@@ -355,7 +182,7 @@ def webhook_primos(request):
 @authentication_classes([])
 @permission_classes([])
 def webhook_pokemon(request):
-    return processar_evento(request, "pokemon", servico_pokemon)
+    return processar_evento(request, "pokemon")
 
 
 @extend_schema(
@@ -380,7 +207,7 @@ def webhook_pokemon(request):
 @authentication_classes([])
 @permission_classes([])
 def webhook_traduzir(request):
-    return processar_evento(request, "traduzir", servico_traduzir)
+    return processar_evento(request, "traduzir")
 
 
 @extend_schema(
@@ -409,7 +236,7 @@ def webhook_traduzir(request):
 @authentication_classes([])
 @permission_classes([])
 def webhook_converter_pdf(request):
-    """View dedicada para upload de PDF — não usa processar_evento genérico."""
+    """View dedicada para upload de PDF."""
     evento = "converter_pdf"
     logger.info("━" * 60)
     logger.info(f"📥 [{evento.upper()}] Nova requisição recebida (multipart/form-data)")
@@ -429,7 +256,6 @@ def webhook_converter_pdf(request):
             "erro": f"Consumer '{consumer.nome}' não inscrito no evento '{evento}'.",
         }, status=403)
 
-    # Valida o arquivo
     arquivo = request.FILES.get("arquivo")
     if not arquivo:
         return Response({"erro": "Campo 'arquivo' é obrigatório (envie um PDF)."}, status=400)
@@ -456,11 +282,11 @@ def webhook_converter_pdf(request):
         evento=evento, payload={"nome_arquivo": arquivo.name, "tamanho_bytes": len(pdf_bytes)},
     )
 
-    thread = threading.Thread(
-        target=processar_em_background,
-        args=(consumer, inscricao, log, payload, servico_converter_pdf),
-    )
-    thread.start()
+    # Enfileira no Celery
+    task = TASK_MAP[evento]
+    task.delay(log.pk, payload, consumer.pk, inscricao.pk)
+
+    logger.info(f"📥 [{evento.upper()}] Task enfileirada no Celery!")
 
     return Response({
         "status": "aceito",
@@ -511,26 +337,11 @@ EVENTOS_VALIDOS = ["gerar_primos", "pokemon", "traduzir", "converter_pdf"]
         },
     }},
     responses={
-        201: {
-            "type": "object",
-            "description": "Consumer cadastrado com sucesso",
-        },
+        201: {"type": "object", "description": "Consumer cadastrado com sucesso"},
         400: {"description": "Dados inválidos ou campos ausentes"},
         409: {"description": "Email já cadastrado"},
     },
     examples=[
-        OpenApiExample(
-            "Cadastro com 2 eventos",
-            value={
-                "nome": "Minha Aplicação",
-                "email": "dev@empresa.com",
-                "inscricoes": [
-                    {"evento": "gerar_primos", "callback_url": "http://localhost:9000/primos/"},
-                    {"evento": "pokemon", "callback_url": "http://localhost:9000/pokemon/"},
-                ],
-            },
-            request_only=True,
-        ),
         OpenApiExample(
             "Cadastro com todos os eventos",
             value={
@@ -569,7 +380,6 @@ def registrar(request):
     if Consumer.objects.filter(email=email).exists():
         return Response({"erro": f"Email '{email}' já está cadastrado"}, status=409)
 
-    # Valida cada inscrição
     for insc in inscricoes:
         evento = insc.get("evento", "")
         callback = insc.get("callback_url", "")
@@ -578,11 +388,9 @@ def registrar(request):
         if evento not in EVENTOS_VALIDOS:
             return Response({"erro": f"Evento '{evento}' inválido. Disponíveis: {EVENTOS_VALIDOS}"}, status=400)
 
-    # Cria consumer
     consumer = Consumer(nome=nome, email=email)
     consumer.save()
 
-    # Cria inscrições
     inscricoes_criadas = []
     for insc in inscricoes:
         obj = Inscricao.objects.create(
@@ -653,8 +461,8 @@ def listar_eventos(request):
                 "nome": "converter_pdf",
                 "rota": "/webhook/converter-pdf/",
                 "metodo": "POST",
-                "descricao": "Converte PDF para Markdown usando Docling",
-                "payload_exemplo": {"pdf_base64": "<base64 do PDF>", "nome_arquivo": "doc.pdf"},
+                "descricao": "Converte PDF para Markdown usando Docling (upload multipart/form-data)",
+                "payload_exemplo": {"arquivo": "(upload PDF)"},
             },
         ],
     })

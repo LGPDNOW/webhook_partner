@@ -21,7 +21,8 @@
       "Bash(gh org:*)",
       "Bash(gh repo:*)",
       "Bash(git remote:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(docker compose:*)"
     ]
   }
 }
