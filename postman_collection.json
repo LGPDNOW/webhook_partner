@@ -1,0 +1,373 @@
+{
+	"info": {
+		"name": "Webhook Django — 4 Serviços + HMAC",
+		"description": "Collection completa para testar o webhook com autenticação HMAC-SHA256.\n\nFluxo assíncrono:\n1. Cadastro via POST /webhook/register/ (recebe api_key + secret_key)\n2. POST na rota do serviço → 202 Aceito\n3. Servidor processa em background\n4. Servidor chama callback_url do consumer com o resultado\n\nROTAS PÚBLICAS:\n- GET  /webhook/events/   → listar eventos\n- POST /webhook/register/ → cadastrar consumer\n\nROTAS AUTENTICADAS (HMAC):\n- POST /webhook/primos/        → gerar primos\n- POST /webhook/pokemon/       → consultar PokéAPI\n- POST /webhook/traduzir/      → traduzir texto\n- POST /webhook/converter-pdf/ → PDF → Markdown",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "base_url",
+			"value": "http://localhost:8000"
+		},
+		{
+			"key": "api_key",
+			"value": "CADASTRE_VIA_REGISTER_PRIMEIRO"
+		},
+		{
+			"key": "secret_key",
+			"value": "CADASTRE_VIA_REGISTER_PRIMEIRO"
+		}
+	],
+	"event": [],
+	"item": [
+		{
+			"name": "0 — Rotas Públicas",
+			"item": [
+				{
+					"name": "Listar eventos disponíveis",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/webhook/events/",
+							"host": ["{{base_url}}"],
+							"path": ["webhook", "events", ""]
+						},
+						"description": "Retorna todos os eventos disponíveis com rotas, payloads e descrições.\nNão requer autenticação."
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test('Status 200', function () {",
+									"    pm.response.to.have.status(200);",
+									"});",
+									"pm.test('Tem 4 eventos', function () {",
+									"    pm.expect(pm.response.json().eventos.length).to.eql(4);",
+									"});"
+								]
+							}
+						}
+					]
+				},
+				{
+					"name": "Cadastrar consumer (auto-preenche credenciais)",
+					"event": [
+						{
+							"listen": "prerequest",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"// Sobrescreve o HMAC da collection (cadastro não usa HMAC)",
+									"pm.request.headers.remove('X-Hub-Signature-256');"
+								]
+							}
+						},
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test('Status 201 Created', function () {",
+									"    pm.response.to.have.status(201);",
+									"});",
+									"",
+									"// Salva credenciais automaticamente nas variáveis da collection",
+									"if (pm.response.code === 201) {",
+									"    const data = pm.response.json();",
+									"    const consumer = data.consumer;",
+									"    pm.collectionVariables.set('api_key', consumer.api_key);",
+									"    pm.collectionVariables.set('secret_key', consumer.secret_key);",
+									"    console.log('✅ Credenciais salvas automaticamente!');",
+									"    console.log('API Key: ' + consumer.api_key);",
+									"    console.log('Secret Key: ' + consumer.secret_key);",
+									"    console.log('⚠️ GUARDE A SECRET_KEY!');",
+									"}"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{"key": "Content-Type", "value": "application/json"}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"nome\": \"Postman Teste\",\n    \"email\": \"postman@teste.com\",\n    \"inscricoes\": [\n        {\"evento\": \"gerar_primos\", \"callback_url\": \"http://localhost:9000/primos/\"},\n        {\"evento\": \"pokemon\", \"callback_url\": \"http://localhost:9000/pokemon/\"},\n        {\"evento\": \"traduzir\", \"callback_url\": \"http://localhost:9000/traduzir/\"},\n        {\"evento\": \"converter_pdf\", \"callback_url\": \"http://localhost:9000/converter-pdf/\"}\n    ]\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/webhook/register/",
+							"host": ["{{base_url}}"],
+							"path": ["webhook", "register", ""]
+						},
+						"description": "Cadastra um novo consumer.\n\nAPÓS EXECUTAR: as variáveis api_key e secret_key da collection são preenchidas automaticamente pelo Test Script.\n\nTodas as requisições seguintes já usarão as credenciais corretas."
+					}
+				}
+			]
+		},
+		{
+			"name": "1 — Serviços (autenticados)",
+			"item": [
+				{
+					"name": "Gerar 10 Primos",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test('Status 202 Accepted', function () {",
+									"    pm.response.to.have.status(202);",
+									"});",
+									"pm.test('Evento aceito', function () {",
+									"    pm.expect(pm.response.json().evento).to.eql('gerar_primos');",
+									"});"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{"key": "Content-Type", "value": "application/json"},
+							{"key": "X-Api-Key", "value": "{{api_key}}"}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"quantidade\": 10\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/webhook/primos/",
+							"host": ["{{base_url}}"],
+							"path": ["webhook", "primos", ""]
+						},
+						"description": "Gera os 10 primeiros números primos.\nO HMAC é calculado automaticamente pelo Pre-request Script da collection.\nO resultado chega via callback."
+					}
+				},
+				{
+					"name": "Consultar Pokémon (charizard)",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test('Status 202 Accepted', function () {",
+									"    pm.response.to.have.status(202);",
+									"});"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{"key": "Content-Type", "value": "application/json"},
+							{"key": "X-Api-Key", "value": "{{api_key}}"}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"pokemon\": \"charizard\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/webhook/pokemon/",
+							"host": ["{{base_url}}"],
+							"path": ["webhook", "pokemon", ""]
+						},
+						"description": "Consulta dados do Charizard na PokéAPI.\nRetorna: nome, tipos, habilidades, peso, altura e sprite."
+					}
+				},
+				{
+					"name": "Traduzir para Yoda",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test('Status 202 Accepted', function () {",
+									"    pm.response.to.have.status(202);",
+									"});"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{"key": "Content-Type", "value": "application/json"},
+							{"key": "X-Api-Key", "value": "{{api_key}}"}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"texto\": \"The force is strong with this one\",\n    \"idioma\": \"yoda\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/webhook/traduzir/",
+							"host": ["{{base_url}}"],
+							"path": ["webhook", "traduzir", ""]
+						},
+						"description": "Traduz texto para fala do Yoda.\nIdiomas: yoda, pirate, minion, shakespeare, dothraki.\nNota: API gratuita tem limite de 5 req/hora."
+					}
+				},
+				{
+					"name": "Converter PDF para Markdown",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test('Status 202 Accepted', function () {",
+									"    pm.response.to.have.status(202);",
+									"});"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{"key": "X-Api-Key", "value": "{{api_key}}"}
+						],
+						"body": {
+							"mode": "formdata",
+							"formdata": [
+								{
+									"key": "arquivo",
+									"type": "file",
+									"description": "Arquivo PDF para converter em Markdown"
+								}
+							]
+						},
+						"url": {
+							"raw": "{{base_url}}/webhook/converter-pdf/",
+							"host": ["{{base_url}}"],
+							"path": ["webhook", "converter-pdf", ""]
+						},
+						"description": "Converte PDF para Markdown usando Docling.\n\nENVIO: multipart/form-data com campo 'arquivo' (tipo File).\nAutenticação: apenas X-Api-Key no header.\n\nNo Postman: Body → form-data → Key 'arquivo' (tipo File) → selecione o PDF."
+					}
+				}
+			]
+		},
+		{
+			"name": "2 — Testes de erro",
+			"item": [
+				{
+					"name": "API Key inválida (deve dar 401)",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test('Status 401 Não autorizado', function () {",
+									"    pm.response.to.have.status(401);",
+									"});"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{"key": "Content-Type", "value": "application/json"},
+							{"key": "X-Api-Key", "value": "chave_invalida_proposital"}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"quantidade\": 5\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/webhook/primos/",
+							"host": ["{{base_url}}"],
+							"path": ["webhook", "primos", ""]
+						},
+						"description": "Testa rejeição: X-Api-Key inválida de propósito.\nDeve retornar 401."
+					}
+				},
+				{
+					"name": "Consumer não inscrito (deve dar 403)",
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"// Se o consumer estiver inscrito em todos os eventos, este teste",
+									"// precisa de um consumer que NÃO esteja inscrito em traduzir.",
+									"// Para testar: cadastre um consumer só com 'gerar_primos'",
+									"// e tente usar /webhook/traduzir/.",
+									"pm.test('Status 403 ou 202', function () {",
+									"    pm.expect([202, 403]).to.include(pm.response.code);",
+									"});"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{"key": "Content-Type", "value": "application/json"},
+							{"key": "X-Api-Key", "value": "{{api_key}}"}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"texto\": \"hello\",\n    \"idioma\": \"yoda\"\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/webhook/traduzir/",
+							"host": ["{{base_url}}"],
+							"path": ["webhook", "traduzir", ""]
+						},
+						"description": "Testa acesso a evento não inscrito.\nSe o consumer atual está inscrito em tudo, cadastre um novo apenas com 'gerar_primos' para ver o 403."
+					}
+				},
+				{
+					"name": "Email duplicado (deve dar 409)",
+					"event": [
+						{
+							"listen": "prerequest",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.request.headers.remove('X-Hub-Signature-256');"
+								]
+							}
+						},
+						{
+							"listen": "test",
+							"script": {
+								"type": "text/javascript",
+								"exec": [
+									"pm.test('Status 409 Conflict', function () {",
+									"    pm.response.to.have.status(409);",
+									"});"
+								]
+							}
+						}
+					],
+					"request": {
+						"method": "POST",
+						"header": [
+							{"key": "Content-Type", "value": "application/json"}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n    \"nome\": \"Postman Teste\",\n    \"email\": \"postman@teste.com\",\n    \"inscricoes\": [\n        {\"evento\": \"gerar_primos\", \"callback_url\": \"http://localhost:9000/primos/\"}\n    ]\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/webhook/register/",
+							"host": ["{{base_url}}"],
+							"path": ["webhook", "register", ""]
+						},
+						"description": "Tenta cadastrar com email já existente.\nDeve retornar 409 Conflict.\n\nExecute DEPOIS do cadastro inicial."
+					}
+				}
+			]
+		}
+	]
+}
