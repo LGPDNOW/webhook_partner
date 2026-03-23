@@ -1,7 +1,10 @@
-# Webhook com Django — Exemplo Instrucional
+# Webhook com Django + Celery + Redis — Exemplo Instrucional
 
 Projeto didático que demonstra como webhooks funcionam na prática,
 replicando o modelo usado por **Stripe**, **GitHub** e outros serviços do mercado.
+
+**Esta branch (`redis`)** usa **Celery + Redis** para processamento assíncrono,
+orquestrado com **Docker Compose**.
 
 ---
 
@@ -9,7 +12,8 @@ replicando o modelo usado por **Stripe**, **GitHub** e outros serviços do merca
 
 - O que é um webhook e quando usar
 - Autenticação por API Key (consumer → servidor) e HMAC-SHA256 (servidor → callback)
-- Fluxo assíncrono: aceita o pedido, processa em background, notifica via callback
+- Processamento assíncrono com Celery + Redis (fila de tarefas)
+- Docker Compose orquestrando 4 containers
 - Como um consumer se cadastra via API, recebe credenciais e consome serviços
 - Cada serviço tem sua própria rota e seu próprio callback
 
@@ -17,41 +21,55 @@ replicando o modelo usado por **Stripe**, **GitHub** e outros serviços do merca
 
 ## Arquitetura
 
-O projeto tem **dois processos** que conversam entre si:
+4 containers Docker que conversam entre si:
 
 ```text
-┌───────────────────────────────────┐       ┌───────────────────────────────────┐
-│       EMITTER (porta 9000)        │       │        DJANGO (porta 8000)        │
-│       Simula o consumer           │       │        Servidor do webhook        │
-│                                   │       │                                   │
-│  ┌─────────────────────────────┐  │       │  Rotas públicas:                  │
-│  │ Menu interativo             │  │       │    GET  /webhook/events/           │
-│  │ (cadastro + escolhe serviço)│──┼──────►│    POST /webhook/register/         │
-│  └─────────────────────────────┘  │       │                                   │
-│                                   │       │  Rotas autenticadas (API Key):     │
-│  Callbacks por serviço:           │       │    POST /webhook/primos/           │
-│    POST /primos/       ◄──────────┼───────┤    POST /webhook/pokemon/          │
-│    POST /pokemon/      ◄──────────┼───────┤    POST /webhook/traduzir/         │
-│    POST /traduzir/     ◄──────────┼───────┤    POST /webhook/converter-pdf/    │
-│    POST /converter-pdf/◄──────────┼───────┤                                   │
-│                                   │       │  Callback assinado com HMAC ────►  │
-│  Valida HMAC do callback          │       │                                   │
-│  Exibe o resultado na tela        │       │  Swagger: /api/docs/              │
-└───────────────────────────────────┘       └───────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Docker Compose                                     │
+│                                                                             │
+│  ┌─────────────────┐    ┌─────────────────┐    ┌────────────────────────┐  │
+│  │   REDIS :6379   │    │   DJANGO :8000  │    │   CELERY WORKER       │  │
+│  │   (broker)      │◄───┤   (API)         │    │   (processa tasks)    │  │
+│  │                 │    │                 │    │                       │  │
+│  │  Fila de tasks  │───►│  Enfileira task ├───►│  Pega da fila         │  │
+│  │                 │    │  Responde 202   │    │  Executa o serviço    │  │
+│  └─────────────────┘    └─────────────────┘    │  Envia callback ──┐  │  │
+│                                                 └──────────────────┼──┘  │
+│                                                                    │     │
+│  ┌──────────────────────────────────────┐                          │     │
+│  │   EMITTER :9000                      │◄─────────────────────────┘     │
+│  │   (consumer simulado)                │  POST /primos/ (com HMAC)      │
+│  │                                      │  POST /pokemon/                │
+│  │   Menu interativo + callback server  │  POST /traduzir/               │
+│  └──────────────────────────────────────┘  POST /converter-pdf/          │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Isso é exatamente como funciona no mercado:**
+**Fluxo com Celery:**
 
-| Analogia | Neste projeto | No Stripe |
+```text
+Consumer → POST /webhook/primos/ → Django valida → responde 202
+                                        ↓
+                                   Enfileira task no Redis
+                                        ↓
+                                   Celery Worker pega da fila
+                                        ↓
+                                   Processa (gera primos)
+                                        ↓
+                                   Envia callback com HMAC → Consumer
+```
+
+**Comparação com a branch `main`:**
+
+| Aspecto | `main` (threads) | `redis` (Celery) |
 |---|---|---|
-| Você (consumer) | `emitter.py` | Sua aplicação |
-| Se cadastrar | `POST /webhook/register/` | Dashboard do Stripe |
-| Receber credenciais | `api_key` + `secret_key` | API Key + Webhook Secret |
-| Informar callback por evento | `callback_url` por inscrição | Endpoint URL no dashboard |
-| Chamar um serviço | `POST /webhook/primos/` | `POST /v1/charges` |
-| Receber aviso | `POST /primos/` (callback) | Stripe chama seu endpoint |
-| Autenticação na ida | API Key (header) | Bearer Token |
-| Autenticação no callback | HMAC-SHA256 | Stripe-Signature |
+| Processamento | `threading.Thread` | Celery task via Redis |
+| Infra | Apenas Django | Docker Compose (4 containers) |
+| Persistência da fila | Perde se o servidor cair | Redis persiste |
+| Retry | Não tem | Celery suporta retry nativo |
+| Monitoramento | Logs apenas | Celery Flower (extensível) |
+| Escalabilidade | Limitado a 1 processo | Múltiplos workers |
 
 ---
 
@@ -67,8 +85,6 @@ VOLTA (servidor → callback):
   O servidor assina com o secret_key do consumer
   O consumer valida para garantir que veio do servidor legítimo
 ```
-
-O `secret_key` **nunca trafega na rede** — só é usado para calcular e validar o HMAC.
 
 ---
 
@@ -117,62 +133,24 @@ O `secret_key` **nunca trafega na rede** — só é usado para calcular e valida
    Header: X-Api-Key: <api_key>
    Body: {"pokemon": "pikachu"}
 
-2. Django:
+2. Django (container web):
    a) Busca consumer pela api_key ──── "quem é?"
    b) Verifica inscrição no evento ─── "tem permissão pra pokemon?"
    c) Responde 202 Accepted ────────── "ok, recebi"
-   d) Dispara thread em background
+   d) Enfileira task no Redis ─────── task.delay()
 
-3. Thread consulta a PokéAPI (pode demorar)
+3. Celery Worker (container worker):
+   a) Pega a task da fila do Redis
+   b) Consulta a PokéAPI
+   c) Atualiza o status no banco (processando → concluído)
+   d) Envia callback assinado com HMAC
 
-4. Quando termina, Django envia POST no callback do consumer:
-   URL: http://localhost:9000/pokemon/  (cadastrado na inscrição)
-   Header: X-Hub-Signature-256: sha256=<HMAC assinado com secret_key>
+4. Callback chega no Emitter (container emitter):
+   URL: http://emitter:9000/pokemon/
+   Header: X-Hub-Signature-256: sha256=<HMAC>
    Body: {"evento": "pokemon", "status": "concluido", "resultado": {...}}
 
-5. Consumer (emitter) recebe o callback:
-   a) Valida HMAC ─── "veio mesmo do servidor?"
-   b) Exibe o resultado na tela
-```
-
----
-
-## Cadastro de consumer
-
-O cadastro é feito via API. Cada inscrição tem **seu próprio callback_url**:
-
-```json
-POST /webhook/register/
-
-{
-    "nome": "Minha Aplicação",
-    "email": "dev@empresa.com",
-    "inscricoes": [
-        {"evento": "gerar_primos", "callback_url": "http://meu-server:9000/primos/"},
-        {"evento": "pokemon",      "callback_url": "http://meu-server:9000/pokemon/"},
-        {"evento": "traduzir",     "callback_url": "http://meu-server:9000/traduzir/"}
-    ]
-}
-```
-
-Resposta:
-
-```json
-{
-    "status": "cadastrado",
-    "consumer": {
-        "nome": "Minha Aplicação",
-        "email": "dev@empresa.com",
-        "api_key": "9f83137e02352894669d79f6f85af6d9",
-        "secret_key": "eccda6da04eb207fe0b4259296c521a2...",
-        "inscricoes": [
-            {"evento": "gerar_primos", "callback_url": "...", "rota": "/webhook/primos/"},
-            {"evento": "pokemon",      "callback_url": "...", "rota": "/webhook/pokemon/"},
-            {"evento": "traduzir",     "callback_url": "...", "rota": "/webhook/traduzir/"}
-        ]
-    },
-    "aviso": "GUARDE a secret_key — ela não será exibida novamente!"
-}
+5. Emitter valida HMAC e exibe o resultado
 ```
 
 ---
@@ -183,141 +161,184 @@ Resposta:
 webhook/
 ├── manage.py                    # CLI do Django
 ├── emitter.py                   # Consumer simulado (callback server + menu)
-├── requirements.txt             # Dependências
+├── Dockerfile                   # Imagem Python 3.11 + dependências
+├── docker-compose.yml           # 4 containers: redis, web, worker, emitter
+├── requirements.txt             # Dependências (local/macOS)
+├── requirements.docker.txt      # Dependências (Docker/Linux, sem pyobjc)
 ├── postman_collection.json      # Collection para Postman
+├── .dockerignore
 ├── .gitignore
 ├── README.md
 │
 ├── core/                        # Projeto Django
-│   ├── settings.py              # Apps, Swagger, banco, limite upload
+│   ├── __init__.py              # Importa celery_app
+│   ├── celery.py                # Configuração do Celery
+│   ├── settings.py              # Apps, Swagger, banco, Redis broker
 │   └── urls.py                  # Rotas: /admin/, /webhook/, /api/docs/
 │
 └── webhook/                     # App do webhook
     ├── models.py                # Consumer, Inscricao, WebhookLog
-    ├── views.py                 # Auth + 4 serviços + registro + callback
+    ├── views.py                 # Auth + rotas + registro (enfileira tasks)
+    ├── tasks.py                 # 4 serviços como Celery tasks + callback
     ├── urls.py                  # 6 rotas (4 serviços + register + events)
     └── admin.py                 # Gerencia consumers, inscrições e logs
 ```
 
 ---
 
-## Instalação
+## Instalação e execução com Docker
 
 ```bash
 # 1. Clone o repositório
 git clone https://github.com/LGPDNOW/webhook_partner.git
 cd webhook_partner
+git checkout redis
+
+# 2. Suba tudo com Docker Compose
+docker compose up --build
+```
+
+Isso cria e sobe 4 containers:
+
+| Container | Porta | Descrição |
+|---|---|---|
+| `redis` | 6379 | Broker do Celery (fila de tasks) |
+| `web` | 8000 | Django API + Admin + Swagger |
+| `worker` | — | Celery Worker (processa os 4 serviços) |
+| `emitter` | 9000 | Consumer simulado (menu + callback server) |
+
+O container `web` roda as migrações e cria o superusuário automaticamente:
+
+**Admin:** `http://localhost:8000/admin/` — `admin` / `admin123`
+
+### Comandos úteis
+
+```bash
+# Ver logs de todos os containers
+docker compose logs -f
+
+# Ver logs só do worker (Celery)
+docker compose logs -f worker
+
+# Ver logs só do emitter
+docker compose logs -f emitter
+
+# Parar tudo
+docker compose down
+
+# Rebuild após mudanças
+docker compose up --build
+```
+
+---
+
+## Instalação sem Docker (local)
+
+```bash
+# 1. Instale e suba o Redis localmente
+brew install redis && redis-server &
 
 # 2. Crie e ative o ambiente virtual
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv venv && source venv/bin/activate
 
 # 3. Instale as dependências
 pip install -r requirements.txt
 
-# 4. Crie o banco e aplique as migrações
+# 4. Migrate e crie o superusuário
 python manage.py migrate
-
-# 5. Crie o superusuário para o Django Admin
 python manage.py createsuperuser
+
+# Terminal 1 — Django
+python manage.py runserver
+
+# Terminal 2 — Celery Worker
+celery -A core worker --loglevel=info
+
+# Terminal 3 — Emitter
+python emitter.py
 ```
 
 ---
 
 ## Passo a passo para testar
 
-### Passo 1 — Subir o servidor Django
+### Passo 1 — Suba os containers
 
 ```bash
-source venv/bin/activate
-python manage.py runserver
+docker compose up --build
 ```
 
-### Passo 2 — Subir o emitter (outro terminal)
+### Passo 2 — Interaja com o emitter
 
 ```bash
-source venv/bin/activate
-python emitter.py
+docker compose exec -it emitter python emitter.py
 ```
 
-O emitter sobe:
-- **Servidor de callback** na porta 9000 (4 rotas, uma por serviço)
-- **Menu interativo** para cadastrar e chamar serviços
+Ou use o Swagger em `http://localhost:8000/api/docs/`.
 
-### Passo 3 — Cadastrar via menu
+### Passo 3 — Cadastrar via Swagger ou emitter
 
-Escolha **C** no menu. O emitter pergunta nome, email, eventos e callback URLs:
+No Swagger, execute `POST /webhook/register/`:
 
-```text
-  📝 CADASTRO DE CONSUMER
-  Nome da aplicação: Minha App
-  Email: dev@empresa.com
-  Eventos (separados por vírgula, ou ENTER para todos): ENTER
-  Callback para 'gerar_primos' (ENTER para http://localhost:9000/primos/): ENTER
-  Callback para 'pokemon' (ENTER para http://localhost:9000/pokemon/): ENTER
-  ...
-
-  ✅ CADASTRO REALIZADO COM SUCESSO!
-  🔑 API_KEY    : 9f83137e02352894...
-  🔐 SECRET_KEY : eccda6da04eb207f...
-  ⚠️  GUARDE A SECRET_KEY — ELA NÃO SERÁ EXIBIDA NOVAMENTE!
+```json
+{
+    "nome": "Minha App",
+    "email": "dev@empresa.com",
+    "inscricoes": [
+        {"evento": "gerar_primos", "callback_url": "http://emitter:9000/primos/"},
+        {"evento": "pokemon", "callback_url": "http://emitter:9000/pokemon/"}
+    ]
+}
 ```
 
-As credenciais são salvas em `.credenciais.json` automaticamente.
+Copie a `api_key` da resposta.
 
 ### Passo 4 — Chamar um serviço
 
-Escolha **1**, **2**, **3** ou **4** no menu:
+No Swagger, execute `POST /webhook/primos/` com header `X-Api-Key`:
 
-```text
-  WEBHOOK CONSUMER — [api_key=9f83137e…]
-  C → 📝 Cadastrar como consumer
-  E → 📋 Ver eventos disponíveis
-  1 → 🔢 POST /webhook/primos/
-  2 → 🐾 POST /webhook/pokemon/
-  3 → 🗣️  POST /webhook/traduzir/
-  4 → 📄 POST /webhook/converter-pdf/
-  0 → Sair
+```json
+{"quantidade": 10}
 ```
 
-### Passo 5 — Acompanhar o debug
+Resposta imediata: `202 Accepted`
 
-**Terminal 1 (Django):**
+### Passo 5 — Acompanhar o processamento
+
+**Logs do Django (web):**
 
 ```text
-[14:30:01] [INFO] 📥 [POKEMON] Nova requisição recebida
-[14:30:01] [DEBUG] 🔑 Autenticando — api_key=9f83137e…
-[14:30:01] [INFO] ✅ Autenticado: Minha App (dev@empresa.com)
-[14:30:01] [INFO] ⚙️  [WORKER] Thread iniciada para evento='pokemon'
-[14:30:01] [INFO] 🐾 [POKEMON] Consultando PokéAPI para 'pikachu'…
-[14:30:02] [INFO] 🐾 [POKEMON] Concluído! pikachu (#25)
-[14:30:02] [INFO] 📤 [CALLBACK] Enviando para http://localhost:9000/pokemon/…
-[14:30:02] [INFO] 📤 [CALLBACK] Entregue com sucesso! HTTP 200
+📥 [GERAR_PRIMOS] Nova requisição recebida
+🔑 Autenticando — api_key=9f77f53d…
+✅ Autenticado: Minha App
+📥 [GERAR_PRIMOS] Task enfileirada no Celery!
 ```
 
-**Terminal 2 (Emitter):**
+**Logs do Celery (worker):**
 
 ```text
-[14:30:01] 📤 POST http://localhost:8000/webhook/pokemon/
-[14:30:01]    Api-Key: 9f83137e…
-[14:30:01] 📨 HTTP 202: Processando. O resultado será enviado para http://localhost:9000/pokemon/
-[14:30:01] ⏳ Aguardando callback…
+Task webhook.gerar_primos received
+⚙️  [CELERY WORKER] Task iniciada: evento='gerar_primos'
+🔢 [PRIMOS] Iniciando geração de 10 primos…
+🔢 [PRIMOS] Concluído! 10 primos gerados. Último: 29
+📤 [CALLBACK] Enviando para http://emitter:9000/primos/…
+📤 [CALLBACK] Entregue com sucesso! HTTP 200
+Task webhook.gerar_primos succeeded in 5.2s
+```
 
-════════════════════════════════════════════════════════════
-  [14:30:02] 📥 CALLBACK RECEBIDO em /pokemon/
-  [14:30:02] 📌 Evento: pokemon
-════════════════════════════════════════════════════════════
-[14:30:02] 🔒 Assinatura HMAC válida — resposta autêntica do servidor
-[14:30:02] 🐾 Nome: pikachu (#25)
-[14:30:02] 🐾 Tipos: ['electric']
-[14:30:02] 🐾 Habilidades: ['static', 'lightning-rod']
+**Logs do Emitter:**
+
+```text
+📥 CALLBACK RECEBIDO em /primos/
+📌 Evento: gerar_primos
+🔒 Assinatura HMAC válida — resposta autêntica do servidor
+🔢 Total: 10 primos
+🔢 Primos: [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
 ```
 
 ### Passo 6 — Verificar no Admin
 
 Acesse `http://localhost:8000/admin/` → **Logs de Webhook**:
-- Qual consumer chamou
-- Qual evento e inscrição
 - Status: recebido → processando → concluído → callback_enviado
 - Payload e resultado completos
 
@@ -325,61 +346,53 @@ Acesse `http://localhost:8000/admin/` → **Logs de Webhook**:
 
 ## Testando com Swagger
 
-Acesse `http://localhost:8000/api/docs/` com o servidor rodando.
+Acesse `http://localhost:8000/api/docs/` com os containers rodando.
 
-O Swagger documenta todas as rotas com payloads de exemplo. Para testar os serviços autenticados:
-
-1. Execute primeiro **POST /webhook/register/** para se cadastrar
+1. Execute `POST /webhook/register/` para se cadastrar
 2. Copie a `api_key` da resposta
 3. Nas rotas de serviço, passe a `api_key` no header `X-Api-Key`
 
-Para ver os resultados, o emitter precisa estar rodando (ele recebe os callbacks).
+Para ver os callbacks, acompanhe os logs do emitter: `docker compose logs -f emitter`
 
 ---
 
 ## Testando com Postman
 
-### Importar a collection
-
-1. Abra o Postman → **Import** → arraste `postman_collection.json`
-2. Execute **"Cadastrar consumer"** primeiro — as credenciais são salvas automaticamente nas variáveis da collection
-3. Todas as requisições seguintes já usam a `api_key` correta
-
-### Requisições disponíveis
+1. Importe `postman_collection.json`
+2. Execute **"Cadastrar consumer"** primeiro — credenciais preenchidas automaticamente
+3. Todas as requisições seguintes já usam a `api_key`
 
 | Pasta | Requisição | Resultado |
 |---|---|---|
 | Rotas Públicas | Listar eventos | 200 |
-| Rotas Públicas | Cadastrar consumer | 201 (auto-preenche api_key) |
+| Rotas Públicas | Cadastrar consumer | 201 |
 | Serviços | Gerar 10 Primos | 202 |
 | Serviços | Consultar Pokémon | 202 |
 | Serviços | Traduzir para Yoda | 202 |
-| Serviços | Converter PDF | 202 (upload de arquivo) |
+| Serviços | Converter PDF | 202 |
 | Testes de erro | API Key inválida | 401 |
 | Testes de erro | Consumer não inscrito | 403 |
 | Testes de erro | Email duplicado | 409 |
-
-Para ver os resultados dos serviços, o emitter precisa estar rodando.
 
 ---
 
 ## Segurança — HMAC no callback
 
-O HMAC é usado apenas no **callback** (servidor → consumer), seguindo o padrão de mercado:
+O HMAC é usado apenas no **callback** (servidor → consumer):
 
 ```text
-Quando o Django termina de processar, envia o resultado:
+Celery Worker termina o processamento e envia:
 
-  POST http://localhost:9000/pokemon/
+  POST http://emitter:9000/pokemon/
   Header: X-Hub-Signature-256: sha256=a1b2c3d4...
   Body: {"evento": "pokemon", "status": "concluido", "resultado": {...}}
 
 O consumer (emitter) valida:
 
-  1. Tem o secret_key (recebeu no cadastro, guardou localmente)
+  1. Tem o secret_key (recebeu no cadastro)
   2. Recalcula: HMAC-SHA256(secret_key, body) → "a1b2c3d4..."
   3. Compara com compare_digest (tempo constante)
-  4. Iguais? → Autêntico ✓  (veio do servidor)
+  4. Iguais? → Autêntico ✓
      Diferentes? → ⚠️ Pode ser forjado
 
 O secret_key NUNCA trafega na rede — só o hash resultante.
@@ -394,7 +407,9 @@ O secret_key NUNCA trafega na rede — só o hash resultante.
 | Servidor | Django 5.x |
 | API REST | Django REST Framework |
 | API docs | drf-spectacular (Swagger/ReDoc) |
+| Task Queue | Celery 5.x |
+| Broker | Redis 7 |
 | Processamento PDF | Docling |
-| Async (demo) | threading.Thread (produção: Celery+Redis) |
+| Containers | Docker Compose |
 | Banco | SQLite (gerado automaticamente) |
 | Emitter | http.server (stdlib Python) |
