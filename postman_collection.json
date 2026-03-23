@@ -1,7 +1,7 @@
 {
 	"info": {
 		"name": "Webhook Django — 4 Serviços + HMAC",
-		"description": "Collection completa para testar o webhook com autenticação HMAC-SHA256.\n\nFluxo assíncrono:\n1. Cadastro via POST /webhook/register/ (recebe api_key + secret_key)\n2. POST na rota do serviço → 202 Aceito\n3. Servidor processa em background\n4. Servidor chama callback_url do consumer com o resultado\n\nROTAS PÚBLICAS:\n- GET  /webhook/events/   → listar eventos\n- POST /webhook/register/ → cadastrar consumer\n\nROTAS AUTENTICADAS (HMAC):\n- POST /webhook/primos/        → gerar primos\n- POST /webhook/pokemon/       → consultar PokéAPI\n- POST /webhook/traduzir/      → traduzir texto\n- POST /webhook/converter-pdf/ → PDF → Markdown",
+		"description": "Collection completa para testar o webhook.\n\nFluxo assíncrono:\n1. Cadastro via POST /webhook/register/ (recebe api_key + secret_key)\n2. POST na rota do serviço com header X-Api-Key → 202 Aceito\n3. Servidor processa em background\n4. Servidor chama callback_url do consumer com resultado assinado via HMAC\n\nROTAS PÚBLICAS:\n- GET  /webhook/events/   → listar eventos\n- POST /webhook/register/ → cadastrar consumer\n\nROTAS AUTENTICADAS (API Key):\n- POST /webhook/primos/        → gerar primos\n- POST /webhook/pokemon/       → consultar PokéAPI\n- POST /webhook/traduzir/      → traduzir texto\n- POST /webhook/converter-pdf/ → PDF → Markdown",
 		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
 	},
 	"variable": [
@@ -11,11 +11,13 @@
 		},
 		{
 			"key": "api_key",
-			"value": "CADASTRE_VIA_REGISTER_PRIMEIRO"
+			"value": "CADASTRE_VIA_REGISTER_PRIMEIRO",
+			"description": "Preenchida automaticamente ao executar o cadastro"
 		},
 		{
 			"key": "secret_key",
-			"value": "CADASTRE_VIA_REGISTER_PRIMEIRO"
+			"value": "",
+			"description": "Salva no cadastro para referência — usada apenas pelo servidor nos callbacks"
 		}
 	],
 	"event": [],
@@ -55,16 +57,6 @@
 				{
 					"name": "Cadastrar consumer (auto-preenche credenciais)",
 					"event": [
-						{
-							"listen": "prerequest",
-							"script": {
-								"type": "text/javascript",
-								"exec": [
-									"// Sobrescreve o HMAC da collection (cadastro não usa HMAC)",
-									"pm.request.headers.remove('X-Hub-Signature-256');"
-								]
-							}
-						},
 						{
 							"listen": "test",
 							"script": {
@@ -144,7 +136,7 @@
 							"host": ["{{base_url}}"],
 							"path": ["webhook", "primos", ""]
 						},
-						"description": "Gera os 10 primeiros números primos.\nO HMAC é calculado automaticamente pelo Pre-request Script da collection.\nO resultado chega via callback."
+						"description": "Gera os 10 primeiros números primos.\nAutenticação: header X-Api-Key.\nO resultado chega via callback."
 					}
 				},
 				{
@@ -329,15 +321,6 @@
 				{
 					"name": "Email duplicado (deve dar 409)",
 					"event": [
-						{
-							"listen": "prerequest",
-							"script": {
-								"type": "text/javascript",
-								"exec": [
-									"pm.request.headers.remove('X-Hub-Signature-256');"
-								]
-							}
-						},
 						{
 							"listen": "test",
 							"script": {
