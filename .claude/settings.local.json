@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(django-admin startproject:*)",
+      "Bash(python3:*)",
+      "Bash(pkill -f \"manage.py runserver\")",
+      "Bash(source venv/bin/activate)",
+      "Bash(pip --version)",
+      "Bash(pip install:*)",
+      "Bash(python -c \"import django; print\\(f''Django {django.VERSION}''\\)\")",
+      "Bash(python -c \"import docling; print\\(''Docling OK''\\)\")",
+      "Bash(pip freeze:*)",
+      "Bash(python manage.py makemigrations)",
+      "Bash(python manage.py migrate)",
+      "Bash(pkill -f \"manage.py\")",
+      "Bash(python manage.py shell -c \":*)",
+      "Bash(python manage.py check)",
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(gh org:*)",
+      "Bash(gh repo:*)",
+      "Bash(git remote:*)",
+      "Bash(git push:*)"
+    ]
+  }
+}

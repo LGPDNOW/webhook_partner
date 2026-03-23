@@ -1,0 +1,86 @@
+Quando o HMAC é usado
+
+  O HMAC é usado em toda comunicação entre os dois lados — tanto na ida quanto na volta:
+
+  Emitter (porta 9000)                         Django (porta 8000)
+        │                                            │
+        │  1. POST /webhook/                         │
+        │     X-Api-Key: abc123                      │
+        │     X-Hub-Signature-256: sha256=f7a3…      │
+        │ ──────────────────────────────────────────►│
+        │                                            ├─ busca consumer pela api_key
+        │                                            ├─ pega o secret_key dele
+        │                                            ├─ recalcula HMAC(secret, body)
+        │                                            ├─ compara com o header
+        │                                            ├─ ✓ bateu → confia na mensagem
+        │                                            │
+        │  ... servidor processa ...                 │
+        │                                            │
+        │  2. POST /callback/                        │
+        │     X-Hub-Signature-256: sha256=b2e1…      │
+        │◄──────────────────────────────────────────┤
+        │                                            │
+        ├─ recalcula HMAC(secret, body)              │
+        ├─ compara com o header                      │
+        ├─ ✓ bateu → confia na mensagem              │
+
+  O que cada peça faz
+
+  ┌─────────────────────┬─────────────────────────┬────────────────────────────────────────────────────────────────┐
+  │        Peça         │        Quem tem         │                         Pra que serve                          │
+  ├─────────────────────┼─────────────────────────┼────────────────────────────────────────────────────────────────┤
+  │ api_key             │ Consumer + Servidor     │ Identifica quem está chamando (é pública, vai no header)       │
+  ├─────────────────────┼─────────────────────────┼────────────────────────────────────────────────────────────────┤
+  │ secret_key          │ Consumer + Servidor     │ Assina o body via HMAC (é secreta, nunca trafega na rede)      │
+  ├─────────────────────┼─────────────────────────┼────────────────────────────────────────────────────────────────┤
+  │ X-Hub-Signature-256 │ Quem envia a requisição │ O hash resultante do HMAC — prova que quem enviou tem o secret │
+  └─────────────────────┴─────────────────────────┴────────────────────────────────────────────────────────────────┘
+
+  Como a validação funciona por dentro
+
+  Passo 1 — Quem ENVIA (emissor)
+
+      body = '{"quantidade": 10}'
+      secret = "8f2052ff53b4c8..."
+
+      HMAC-SHA256(secret, body) → "f7a3b9c1d4e..."
+                                        ↑
+                                  envia isso no header
+                                  (o secret NÃO vai)
+
+
+  Passo 2 — Quem RECEBE (receptor)
+
+      Recebe o body + o header "sha256=f7a3b9c1d4e..."
+
+      Tem o MESMO secret guardado no banco.
+
+      Recalcula: HMAC-SHA256(secret, body) → "f7a3b9c1d4e..."
+
+      Compara os dois:
+      ┌────────────────────────────┬────────────────────────────┐
+      │ Recebido no header         │ Calculado localmente       │
+      ├────────────────────────────┼────────────────────────────┤
+      │ sha256=f7a3b9c1d4e...      │ sha256=f7a3b9c1d4e...      │
+      └────────────────────────────┴────────────────────────────┘
+                      iguais? → mensagem autêntica ✓
+
+  Por que é seguro
+
+  1. O secret nunca viaja na rede — só o hash resultante. Mesmo interceptando a requisição, o atacante não consegue
+  extrair o secret a partir do hash (SHA256 é irreversível).
+  2. Não dá pra forjar — se o atacante mudar 1 byte do body, o hash muda completamente. Sem o secret, ele não consegue
+  calcular o hash novo.
+  3. compare_digest — a comparação usa tempo constante. Se usasse ==, um atacante poderia medir a diferença de tempo
+  para adivinhar o hash byte a byte (timing attack).
+  4. Cada consumer tem seu próprio secret — se um vazar, você revoga só aquele, sem afetar os outros.
+
+  Analogia simples
+
+  É como um lacre numerado em uma caixa:
+
+  - Você e o banco combinam um número secreto (secret_key)
+  - Você envia a caixa com um lacre gerado a partir do conteúdo + o número
+  - O banco recebe, gera o lacre com o mesmo número
+  - Se os lacres batem → ninguém mexeu na caixa
+  - O número secreto nunca saiu do cofre de nenhum dos dois
